@@ -27,13 +27,10 @@ def get_model_complexity(model):
     input_video = torch.randn(1, 3, 8, 224, 224)
 
     if hasattr(model, 'module'):
-    # 如果是 DDP/DP 模式，取 .module 里的内容
       real_model = model.module
     else:
-        # 如果是单卡模式，直接用 model
+  
       real_model = model
-
-    # 现在从解包后的 real_model 中获取 visual 部分
     model_to_profile = real_model.visual
 
     macs, params = profile(model_to_profile, inputs=(input_video, ))
@@ -266,29 +263,7 @@ def main():
                 text_inputs = classes.cuda()
                 text_features,_ = model.module.encode_text(text_inputs)
                 text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-                # text_features /= text_features.norm(dim=-1, keepdim=True)
-                # pdb.set_trace()
-                # nm = text_features.cpu().numpy()
-                # corr2=np.corrcoef(nm)
-                # print(corr2)
-    if args.vis:
-      vis_save_path = "visualization_results"
-      visualizer = FeatureVisualizer(model, save_root=vis_save_path)
-      attn_vis = AttentionVisualizer(model, vis_save_path)
-      clip_cam = CLIPSimilarityMap(model)
 
-      # ====== 对时序模块进行可视化的实验 ======
-      temp_vis = TemporalDynamicsVisualizer(model, "visualization_results")
-      temp_vis.register_hooks()
-
-      activation = {}
-      def get_activation(name):
-          def hook(model, input, output):
-              activation[name] = output.detach()
-          return hook
-      
-      target_layer = model.module.visual.transformer.resblocks[-1]
-      handle = target_layer.register_forward_hook(get_activation('last_layer'))
       i = 0   
 
     for data, labels in metric_logger.log_every(dataloader_val, 10, header):
@@ -303,7 +278,7 @@ def main():
       
       if data.dim() == 6:
         b, v, c, t, h, w = data.shape
-        data = data.flatten(0, 1) # 变成 [B*V, C, T, H, W]
+        data = data.flatten(0, 1)
 
       raw_data = data.clone()
 
@@ -312,35 +287,6 @@ def main():
         with model.no_sync():
           with torch.no_grad():
             image_features,_,logits, _ = model.module.encode_image(data)
-
-            if save_vis:
-                feat = activation['last_layer'] 
-                
-                heatmaps = visualizer.process_vit_feature(feat, H_img=224, W_img=224)
-                
-                # 保存图片
-                i += 1
-                attn_vis.save_attention_map(raw_data.cpu(), batch_idx=i)
-                visualizer.save_batch(raw_data, heatmaps, batch_idx=i)
-                # ================CLIP Similarity Map ===================
-                with torch.enable_grad():
-                    # 必须克隆一份 data，否则会影响原来的 tensor
-                    # 并且需要 detach() 断开之前的引用，重新设置 requires_grad
-                    vis_data = data.clone().detach()
-                    vis_data.requires_grad = True
-                    
-                    # 定义提示词
-                    prompt = "An ultrasound scan showing anechoic free fluid"
-                    
-                    # 定义保存路径
-                    save_path = os.path.join(vis_save_path+'/img_text_sim', f"gradcam_b{i}_fluid.png")
-                    
-                    # 运行可视化
-                    clip_cam.save_visualization(vis_data, prompt, save_path)
-                
-                # 清理显存
-                del feat
-                activation = {} # 重置字典
         scores = logits.softmax(dim=-1)
         scores = scores.view(B, V, -1).mean(dim=1)
         acc1_fc = (scores.topk(1, dim=1)[1] == labels.view(-1, 1)).sum(dim=-1).float().mean().item() * 100
@@ -363,14 +309,9 @@ def main():
       # metric_logger.meters['acc5'].update(acc5, n=similarity.size(0))
       metric_logger.meters['acc1_fc'].update(acc1_fc, n=similarity.size(0))
       # metric_logger.meters['acc5_fc'].update(acc5_fc, n=similarity.size(0))
-    if dist.get_rank() == 0 and args.vis: # 只在主进程画
-        temp_vis.plot_full_video_analysis(video_name="val_video_sample")
-    if args.vis:
-      handle.remove()
-      clip_cam.remove_hooks()
-      temp_vis.remove_hooks()
 
-    if dist.get_rank() == 0: # 只在主进程计算和打印
+
+    if dist.get_rank() == 0: 
         print("\n" + "="*20 + " Detailed Metrics " + "="*20)
         print("Unique targets:", np.unique(all_targets))
         print("Unique preds:", np.unique(all_preds))
@@ -379,7 +320,6 @@ def main():
 
         target_names = ["Normal", "Abnormal"]
         jaccard_per_class = jaccard_score(all_targets, all_preds, average=None)
-        # average='macro': 返回平均 Jaccard (即 mIoU)
         jaccard_mean = jaccard_score(all_targets, all_preds, average='macro')
         print("-" * 30)
         print("Jaccard Index (IoU) Analysis:")
@@ -398,8 +338,6 @@ def main():
   # start_epoch = 5
   if args.eval_only:
     evaluate()
-    run_tsne_visualization(args, model_without_ddp, dataset_val)
-
     return
   loss_img = KLLoss()
   loss_txt = KLLoss()
@@ -495,40 +433,5 @@ def main():
       with open(os.path.join(args.save_dir, 'log.txt'), 'a') as f:
         f.write(json.dumps(log_stats) + '\n')
 
-def run_tsne_visualization(args, model, dataset_val):
-    print("--- Starting T-SNE Visualization Workflow ---")
-    
-    # 1. 创建一个专门的 DataLoader，Batch Size=1，Shuffle=False
-    # 这样可以保证数据是严格按顺序一行行进来的
-    tsne_loader = torch.utils.data.DataLoader(
-        dataset_val,
-        batch_size=1,        # 每次处理一行
-        shuffle=False,       # 关键：不要打乱！
-        num_workers=4,
-        pin_memory=True
-    )
-    
-    # 2. 初始化 Visualizer
-    vis_save_path = "visualization_results"
-    tsne_vis = TSNEVisualizer(model, vis_save_path)
-    
-    # 3. 提取特征
-    # max_batches 控制你想画多少行。
-    # 如果一个视频大概有 200 行，就设为 200
-    tsne_vis.extract_features(tsne_loader, max_batches=600)
-    
-    # 4. 绘图
-    # 这里的 video_id 只是图上的标题
-    tsne_vis.plot_comet_tsne(video_id="Val_Video_Trace")
-    tsne_vis.plot_barcode(video_id="Val_Video_Rhythm")
-    tsne_vis.plot_motion_manifold(video_id="Val_Video_Manifold")
-    tsne_vis.plot_lda_separation(video_id="Val_Video_LDA")
-    tsne_vis.plot_lda_raincloud(video_id="Val_Video_Raincloud")
-    tsne_vis.plot_lda_ridge_by_patient(num_patients=2, frames_per_patient=155)
-
-    
-    print("--- T-SNE Visualization Finished ---")
-  
-  
 
 if __name__ == '__main__': main()
