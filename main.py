@@ -1,0 +1,534 @@
+import argparse
+import math
+import json
+import os
+
+import torch
+import torch.nn.functional as F
+import torch.distributed as dist
+from torch.utils.data import DataLoader
+from prefetch_generator import BackgroundGenerator
+from utils import *
+import ours_models_adapter
+from video_dataset import VideoDataset, VideoDatasetDCM, VideoDatasetDCMPhase
+from configs import DATASETS
+import numpy as np
+import shutil
+from sklearn.metrics import classification_report, confusion_matrix, jaccard_score
+
+
+from vis_utils import FeatureVisualizer, AttentionVisualizer, CLIPSimilarityMap
+from vis_utils import TemporalDynamicsVisualizer, TSNEVisualizer
+from thop import profile
+def get_model_complexity(model):
+    model.cpu()
+    model.float()
+    model.eval()
+    input_video = torch.randn(1, 3, 8, 224, 224)
+
+    if hasattr(model, 'module'):
+    # 如果是 DDP/DP 模式，取 .module 里的内容
+      real_model = model.module
+    else:
+        # 如果是单卡模式，直接用 model
+      real_model = model
+
+    # 现在从解包后的 real_model 中获取 visual 部分
+    model_to_profile = real_model.visual
+
+    macs, params = profile(model_to_profile, inputs=(input_video, ))
+
+    gflops = macs / 1e9
+    mparams = params / 1e6
+
+    print(f"=============================================")
+    print(f"Model: {model.__class__.__name__}")
+    print(f"Input Shape: {input_video.shape}")
+    print(f"GFLOPs: {gflops:.2f} G")
+    print(f"Params: {mparams:.2f} M")
+    print(f"=============================================")
+
+class DataLoaderX(DataLoader):
+    def __iter__(self):
+      return BackgroundGenerator(super().__iter__())
+    
+def main():
+  parser = argparse.ArgumentParser()
+  parser.add_argument('--model', type=str, required=True,
+      help='model architecture name.')
+
+  parser.add_argument('--batch_size', type=int, default=16,
+      help='batch size per gpu')
+  parser.add_argument('--blr', type=float, default=1e-3,
+      help='base learning rate per 256 samples. actual base learning rate is linearly scaled '
+           'based on batch size.')
+  parser.add_argument('--lr', type=float,
+      help='constant base learning rate. overrides the --blr option.')
+  parser.add_argument('--weight_decay', type=float, default=1e-2,
+      help='optimizer weight decay.')
+  parser.add_argument('--epochs', type=int, default=10,
+      help='number of training epochs.')
+  parser.add_argument('--warmup_epochs', type=int, default=2,
+      help='number of warmup epochs.')
+  parser.add_argument('--eval_only', action='store_true',
+      help='only run evaluation.')
+  parser.add_argument('--vis', action='store_true',
+      help='only run evaluation.')
+  parser.add_argument("--local_rank", "--local-rank", type=int, default=-1)
+  # This needs to be explicitly passed in
+  # parser.add_argument("--local_world_size", type=int, default=1)
+  parser.add_argument('--save_dir', type=str,
+      help='directory to save the checkpoints in. if empty no checkpoints are saved.')
+  parser.add_argument('--auto_resume', action='store_true',
+      help='automatically resume from the last checkpoint.')
+  parser.add_argument('--auto_remove', action='store_true',
+      help='automatically remove old checkpoint after generating a new checkpoint.')
+  parser.add_argument('--save_freq', type=int, default=1,
+      help='save checkpoint every n epochs.')
+  parser.add_argument('--resume', type=str,
+      help='manually specify checkpoint to resume from. overrides --auto_resume and --pretrain.')
+  parser.add_argument('--label_csv', type=str,
+      help='manually specify label_csv.')
+  parser.add_argument('--pretrain', type=str,
+      help='initialize model from the given checkpoint, discard mismatching weights and '
+           'do not load optimizer states.')
+
+  parser.add_argument('--dataset', type=str, required=True, choices=DATASETS.keys(),
+      help='name of the dataset. the dataset should be configured in config.py.')
+  parser.add_argument('--mirror', action='store_true',
+      help='whether mirror augmentation (i.e., random horizontal flip) should be used during training.')
+  parser.add_argument('--spatial_size', type=int, default=224,
+      help='spatial crop size.')
+  parser.add_argument('--num_frames', type=int, default=8,
+      help='number of sampled frames per video.')
+  parser.add_argument('--sampling_rate', type=int, default=0,
+      help='interval between sampled frames. 0 means frames evenly covers the whole video '
+           '(i.e., with variable frame interval depending on the video length).)')
+  parser.add_argument('--num_spatial_views', type=int, default=1, 
+      help='number of spatial crops used for testing (only 1 and 3 supported currently).')  #choices=[1, 3],
+  parser.add_argument('--num_temporal_views', type=int, default=1,
+      help='number of temporal crops used for testing.')
+  parser.add_argument('--auto_augment', type=str,
+      help='enable RandAugment of a certain configuration. see the examples in the SSv2 training scripts.')
+  parser.add_argument('--num_workers', type=int, default=16,
+      help='number of dataloader workers.')
+  parser.add_argument('--resize_type', type=str, default='random_resized_crop',
+      choices=['random_resized_crop', 'random_short_side_scale_jitter'],
+      help='spatial resize type. supported modes are "random_resized_crop" and "random_short_side_scale_jitter".'
+           'see implementation in video_dataset/transform.py for the details.')
+  parser.add_argument('--scale_range', type=float, nargs=2, default=[0.08, 1.0],
+      help='range of spatial random resize. for random_resized_crop, the range limits the portion of the cropped area; '
+           'for random_short_side_scale_jitter, the range limits the target short side (as the multiple of --spatial_size).')
+  parser.add_argument('--print_freq', type=int, default=10, metavar='N',
+      help='print a log message every N training steps.')
+  parser.add_argument('--eval_freq', type=int, default=1, metavar='N',
+      help='evaluate on the validation set every N epochs.')
+
+  args = parser.parse_args()
+  local_rank = args.local_rank
+  # print(local_rank)
+  torch.cuda.set_device(local_rank)
+  dist.init_process_group('nccl')
+  
+  device = torch.device("cuda", local_rank)
+  # gpu_id = dist.get_rank() % torch.cuda.device_count()
+  # torch.cuda.set_device(gpu_id)
+  # setup_for_distributed(dist.get_rank() == 0)
+
+  print("{}".format(args).replace(', ', ',\n'))
+
+  print('creating model')
+  classes, num_text_aug, text_dict,classes_dict = text_prompt(args.label_csv)
+
+  model = ours_models_adapter.__dict__[args.model](num_classes=DATASETS[args.dataset]['NUM_CLASSES'],num_frames=args.num_frames).cuda().train()
+  for k,v in model.named_parameters():
+    if 'adapter' in k:
+      v.requires_grad = True
+      v.data = v.data.float()
+      # if '12' in k:
+      #     print(k)
+    else:
+      v.requires_grad = False
+
+  n_trainable_params = 0
+  for n, p in model.named_parameters():
+    if p.requires_grad:
+      print('Trainable param: %s, %s, %s' % (n, p.size(), p.dtype))
+      n_trainable_params += p.numel()
+  print('Total trainable params:', n_trainable_params, '(%.2f M)' % (n_trainable_params / 1000000))
+  model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
+  model_without_ddp = model.module
+  
+  # pdb.set_trace()
+  print('creating dataset')
+  if not args.eval_only:
+    dataset_train = VideoDatasetDCMPhase(
+        list_path=DATASETS[args.dataset]['TRAIN_LIST'],
+        data_root=DATASETS[args.dataset]['TRAIN_ROOT'],
+        random_sample=True,
+        mirror=args.mirror,
+        spatial_size=args.spatial_size,
+        auto_augment=args.auto_augment,
+        num_frames=args.num_frames,
+        sampling_rate=args.sampling_rate,
+        resize_type=args.resize_type,
+        scale_range=args.scale_range,
+        )
+    print('train dataset:', dataset_train)
+  dataset_val = VideoDatasetDCMPhase(
+      list_path=DATASETS[args.dataset]['VAL_LIST'],
+      data_root=DATASETS[args.dataset]['VAL_ROOT'],
+      random_sample=False,
+      spatial_size=args.spatial_size,
+      num_frames=args.num_frames,
+      sampling_rate=args.sampling_rate,
+      num_spatial_views=args.num_spatial_views,
+      num_temporal_views=args.num_temporal_views,
+      )
+  print('val dataset:', dataset_val)
+
+  if not args.eval_only:
+    dataloader_train = DataLoaderX(
+        dataset_train,
+        batch_size=args.batch_size,
+        sampler=torch.utils.data.DistributedSampler(dataset_train),
+        num_workers=args.num_workers,
+        pin_memory=True,
+        )
+  dataloader_val = DataLoaderX(
+      torch.utils.data.Subset(dataset_val, range(dist.get_rank(), len(dataset_val), dist.get_world_size())),
+      batch_size=1,
+      shuffle=False,
+      num_workers=args.num_workers,
+      pin_memory=True,
+      )
+  shutil.copy('ours_models_adapter.py', args.save_dir)
+  shutil.copy('utils.py', args.save_dir)
+  shutil.copy('main.py', args.save_dir)
+  if args.eval_only:
+    optimizer = None
+    loss_scaler = None
+    lr_sched = None
+  else:
+    if args.lr is not None:
+      print('using absolute lr:', args.lr)
+    else:
+      print('using relative lr (per 256 samples):', args.blr)
+      args.lr = args.blr * args.batch_size * dist.get_world_size() / 256
+      print('effective lr:', args.lr)
+    
+    params_with_decay, params_without_decay = [], []
+    text_params_with_decay, text_params_without_decay = [], []
+    for n, p in model.named_parameters():
+      if not p.requires_grad:
+        continue
+      if '.bias' in n:
+        if 'textad_' in n:
+            # pdb.set_trace()
+            text_params_without_decay.append(p)
+        else:
+            params_without_decay.append(p)
+      else:
+        if 'textad_' in n:
+          text_params_with_decay.append(p)  
+        else:
+          params_with_decay.append(p)
+    optimizer = torch.optim.AdamW(
+        [
+          {'params': params_with_decay, 'lr': args.lr, 'weight_decay': args.weight_decay},
+          {'params': text_params_with_decay, 'lr': args.lr/2, 'weight_decay': args.weight_decay},
+          {'params': params_without_decay, 'lr': args.lr, 'weight_decay': 0.},
+          {'params': text_params_without_decay, 'lr': args.lr/2, 'weight_decay': 0.}
+        ],
+        )
+    print(optimizer)
+    loss_scaler = torch.cuda.amp.GradScaler()
+    
+    def lr_func(step):
+      epoch = step / len(dataloader_train)
+      if epoch < args.warmup_epochs:
+        return epoch / args.warmup_epochs
+      else:
+        return 0.5 + 0.5 * math.cos((epoch - args.warmup_epochs) / (args.epochs - args.warmup_epochs) * math.pi)
+    lr_sched = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_func)
+
+  def evaluate(log_stats=None):
+    
+    metric_logger = MetricLogger(delimiter="  ")
+    header = 'Test:'
+    model.eval()
+    # get_model_complexity(model)
+    all_preds = []
+    all_targets = []
+    with torch.cuda.amp.autocast():
+        with model.no_sync():
+            with torch.no_grad():
+                text_inputs = classes.cuda()
+                text_features,_ = model.module.encode_text(text_inputs)
+                text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+                # text_features /= text_features.norm(dim=-1, keepdim=True)
+                # pdb.set_trace()
+                # nm = text_features.cpu().numpy()
+                # corr2=np.corrcoef(nm)
+                # print(corr2)
+    if args.vis:
+      vis_save_path = "visualization_results"
+      visualizer = FeatureVisualizer(model, save_root=vis_save_path)
+      attn_vis = AttentionVisualizer(model, vis_save_path)
+      clip_cam = CLIPSimilarityMap(model)
+
+      # ====== 对时序模块进行可视化的实验 ======
+      temp_vis = TemporalDynamicsVisualizer(model, "visualization_results")
+      temp_vis.register_hooks()
+
+      activation = {}
+      def get_activation(name):
+          def hook(model, input, output):
+              activation[name] = output.detach()
+          return hook
+      
+      target_layer = model.module.visual.transformer.resblocks[-1]
+      handle = target_layer.register_forward_hook(get_activation('last_layer'))
+      i = 0   
+
+    for data, labels in metric_logger.log_every(dataloader_val, 10, header):
+      # pdb.set_trace()
+      data, labels = data.cuda(), labels.cuda()
+      # pdb.set_trace()
+      if dist.get_rank() == 0 and args.vis:
+        save_vis = 1 
+      else:
+        save_vis = 0
+      B, V = data.size(0), data.size(1)
+      
+      if data.dim() == 6:
+        b, v, c, t, h, w = data.shape
+        data = data.flatten(0, 1) # 变成 [B*V, C, T, H, W]
+
+      raw_data = data.clone()
+
+      # pdb.set_trace()
+      with torch.cuda.amp.autocast():
+        with model.no_sync():
+          with torch.no_grad():
+            image_features,_,logits, _ = model.module.encode_image(data)
+
+            if save_vis:
+                feat = activation['last_layer'] 
+                
+                heatmaps = visualizer.process_vit_feature(feat, H_img=224, W_img=224)
+                
+                # 保存图片
+                i += 1
+                attn_vis.save_attention_map(raw_data.cpu(), batch_idx=i)
+                visualizer.save_batch(raw_data, heatmaps, batch_idx=i)
+                # ================CLIP Similarity Map ===================
+                with torch.enable_grad():
+                    # 必须克隆一份 data，否则会影响原来的 tensor
+                    # 并且需要 detach() 断开之前的引用，重新设置 requires_grad
+                    vis_data = data.clone().detach()
+                    vis_data.requires_grad = True
+                    
+                    # 定义提示词
+                    prompt = "An ultrasound scan showing anechoic free fluid"
+                    
+                    # 定义保存路径
+                    save_path = os.path.join(vis_save_path+'/img_text_sim', f"gradcam_b{i}_fluid.png")
+                    
+                    # 运行可视化
+                    clip_cam.save_visualization(vis_data, prompt, save_path)
+                
+                # 清理显存
+                del feat
+                activation = {} # 重置字典
+        scores = logits.softmax(dim=-1)
+        scores = scores.view(B, V, -1).mean(dim=1)
+        acc1_fc = (scores.topk(1, dim=1)[1] == labels.view(-1, 1)).sum(dim=-1).float().mean().item() * 100
+        # acc5_fc = (scores.topk(5, dim=1)[1] == labels.view(-1, 1)).sum(dim=-1).float().mean().item() * 100
+        
+        # image_features /= image_features.norm(dim=-1, keepdim=True)   
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True) 
+        
+        similarity = (100.0 * image_features @ text_features.T)
+        similarity = similarity.softmax(dim=-1)
+
+        preds = similarity.argmax(dim=-1)
+        all_preds.extend(preds.cpu().numpy())
+        all_targets.extend(labels.cpu().numpy())
+
+        similarity = similarity.view(B, V, -1).mean(dim=1)
+        acc1 = (similarity.topk(1, dim=1)[1] == labels.view(-1, 1)).sum(dim=-1).float().mean().item() * 100
+        # acc5 = (similarity.topk(5, dim=1)[1] == labels.view(-1, 1)).sum(dim=-1).float().mean().item() * 100
+      metric_logger.meters['acc1'].update(acc1, n=similarity.size(0))
+      # metric_logger.meters['acc5'].update(acc5, n=similarity.size(0))
+      metric_logger.meters['acc1_fc'].update(acc1_fc, n=similarity.size(0))
+      # metric_logger.meters['acc5_fc'].update(acc5_fc, n=similarity.size(0))
+    if dist.get_rank() == 0 and args.vis: # 只在主进程画
+        temp_vis.plot_full_video_analysis(video_name="val_video_sample")
+    if args.vis:
+      handle.remove()
+      clip_cam.remove_hooks()
+      temp_vis.remove_hooks()
+
+    if dist.get_rank() == 0: # 只在主进程计算和打印
+        print("\n" + "="*20 + " Detailed Metrics " + "="*20)
+        print("Unique targets:", np.unique(all_targets))
+        print("Unique preds:", np.unique(all_preds))
+
+        print(classification_report(all_targets, all_preds, target_names=["Normal", "Abnormal"],digits=5))
+
+        target_names = ["Normal", "Abnormal"]
+        jaccard_per_class = jaccard_score(all_targets, all_preds, average=None)
+        # average='macro': 返回平均 Jaccard (即 mIoU)
+        jaccard_mean = jaccard_score(all_targets, all_preds, average='macro')
+        print("-" * 30)
+        print("Jaccard Index (IoU) Analysis:")
+        for name, score in zip(target_names, jaccard_per_class):
+            print(f"  {name:10s}: {score:.4f}")
+        print(f"  {'Mean IoU':10s}: {jaccard_mean:.4f}")
+        print("-" * 30)
+        print("="*60 + "\n")
+    metric_logger.synchronize_between_processes()
+    print('* Acc@1 {top1.global_avg:.3f} ////AccFC@1 {top1_fc.global_avg:.3f} '
+        .format(top1=metric_logger.acc1, top1_fc=metric_logger.acc1_fc))
+    if log_stats is not None:
+      log_stats.update({'val_' + k: meter.global_avg for k, meter in metric_logger.meters.items()})
+
+  start_epoch = load_model(args, model_without_ddp, optimizer, lr_sched, loss_scaler)
+  # start_epoch = 5
+  if args.eval_only:
+    evaluate()
+    run_tsne_visualization(args, model_without_ddp, dataset_val)
+
+    return
+  loss_img = KLLoss()
+  loss_txt = KLLoss()
+  for epoch in range(start_epoch, args.epochs):
+    dataloader_train.sampler.set_epoch(epoch)
+    metric_logger = MetricLogger(delimiter="  ")
+    metric_logger.add_meter('lr', SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    header = 'Epoch: [{}]'.format(epoch)
+    with torch.no_grad():
+      # pdb.set_trace()
+      text_inputs = classes.to(device)
+      # text_features = model.module.encode_text(text_inputs)
+      # text_features /= text_features.norm(dim=-1, keepdim=True)
+    model.train()
+    for step, (data, labels) in enumerate(metric_logger.log_every(dataloader_train, args.print_freq, header)):
+      # if step>1:
+      #   break
+      
+      text_id = np.random.randint(num_text_aug,size=len(labels))
+      # texts = [text_dict[j][i,:] for i,j in zip(labels,text_id)]
+      text_inputs = torch.stack([text_dict[j][i, :] for i, j in zip(labels.cpu().numpy(), text_id)])
+      
+      text_inputs = text_inputs.long().cuda()
+      data, labels = data.cuda(), labels.cuda()
+      # pdb.set_trace()
+      classes_name = [[label,classes_dict[label]] for label in labels.tolist()] 
+      
+      # data, labels,mlm_input_tokens_ids,mlm_labels = data.cuda(), labels.cuda(),mlm_input_tokens_ids.long().cuda(),mlm_labels.long().cuda()
+      optimizer.zero_grad()
+      
+      with torch.cuda.amp.autocast():
+        
+        # image_embedding = model.module.encode_image(data)
+        
+        # logit_scale = model.module.logit_scale.exp()
+        # logits_per_image, logits_per_text = create_logits(image_embedding,text_embedding,logit_scale)
+          
+        # logits_per_image, logits_per_text,image_embedding,text_mlm_inputs,image_mlm_inputs,logits = model(data,mlm_input_tokens_ids)
+        logits_per_image, logits_per_text, image_embedding, logits = model(data, text_inputs)
+        
+        acc1_fc = (logits.topk(1, dim=1)[1] == labels.view(-1, 1)).sum(dim=-1).float().mean().item() * 100
+        loss_fc = F.cross_entropy(logits, labels)
+        # pdb.set_trace()
+
+        ground_truth = torch.tensor(gen_label(labels),dtype=data.dtype,device=device)
+        loss_imgs = loss_img(logits_per_image,ground_truth)
+        loss_texts = loss_txt(logits_per_text,ground_truth)
+        total_loss = (loss_imgs + loss_texts)/2
+        # pdb.set_trace()
+        text_features,_ = model.module.encode_text(text_inputs)
+        # text_features /= text_features.norm(dim=-1, keepdim=True)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        similarity = (100.0 * image_embedding @ text_features.T)
+        similarity = similarity.softmax(dim=-1)
+        acc1 = (similarity.topk(1, dim=-1)[1] == labels.view(-1, 1)).sum(dim=-1).float().mean().item() * 100
+
+        loss = F.cross_entropy(similarity, labels)
+        total_loss = (total_loss + loss)/2 + loss_fc
+
+      loss_scaler.scale(total_loss).backward()
+      loss_scaler.step(optimizer)
+      lr_sched.step()
+      loss_scaler.update()
+
+      metric_logger.update(
+          loss=total_loss.item(),
+          loss_fc=loss_fc.item(),
+          lr=optimizer.param_groups[0]['lr'],
+          acc1=acc1, 
+          acc1_fc=acc1_fc, 
+          )
+
+    print('Averaged stats:', metric_logger)
+    log_stats = {'train_' + k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
+    save_model(args, epoch, model_without_ddp, optimizer, lr_sched, loss_scaler)
+    if epoch >= 30:
+        args.eval_freq = 2
+    if 'k400' in args.dataset and epoch >= 9:
+        args.eval_freq = 1
+    if (epoch + 1) % args.eval_freq == 0 or (epoch + 1) == args.epochs:
+      evaluate(log_stats)
+
+    if args.save_dir is not None and dist.get_rank() == 0:
+      n_total_params, n_trainable_params = 0, 0
+      for n, p in model_without_ddp.named_parameters():
+        n_total_params += p.numel()
+        if p.requires_grad:
+          n_trainable_params += p.numel()
+      log_stats['epoch'] = epoch
+      log_stats['n_trainable_params'] = n_trainable_params
+      log_stats['n_total_params'] = n_total_params
+      with open(os.path.join(args.save_dir, 'log.txt'), 'a') as f:
+        f.write(json.dumps(log_stats) + '\n')
+
+def run_tsne_visualization(args, model, dataset_val):
+    print("--- Starting T-SNE Visualization Workflow ---")
+    
+    # 1. 创建一个专门的 DataLoader，Batch Size=1，Shuffle=False
+    # 这样可以保证数据是严格按顺序一行行进来的
+    tsne_loader = torch.utils.data.DataLoader(
+        dataset_val,
+        batch_size=1,        # 每次处理一行
+        shuffle=False,       # 关键：不要打乱！
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    # 2. 初始化 Visualizer
+    vis_save_path = "visualization_results"
+    tsne_vis = TSNEVisualizer(model, vis_save_path)
+    
+    # 3. 提取特征
+    # max_batches 控制你想画多少行。
+    # 如果一个视频大概有 200 行，就设为 200
+    tsne_vis.extract_features(tsne_loader, max_batches=600)
+    
+    # 4. 绘图
+    # 这里的 video_id 只是图上的标题
+    tsne_vis.plot_comet_tsne(video_id="Val_Video_Trace")
+    tsne_vis.plot_barcode(video_id="Val_Video_Rhythm")
+    tsne_vis.plot_motion_manifold(video_id="Val_Video_Manifold")
+    tsne_vis.plot_lda_separation(video_id="Val_Video_LDA")
+    tsne_vis.plot_lda_raincloud(video_id="Val_Video_Raincloud")
+    tsne_vis.plot_lda_ridge_by_patient(num_patients=2, frames_per_patient=155)
+
+    
+    print("--- T-SNE Visualization Finished ---")
+  
+  
+
+if __name__ == '__main__': main()
