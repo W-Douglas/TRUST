@@ -2,6 +2,6 @@
 
 <!-- 让图片居中，并限制宽度为 80% -->
 <p align="center">
-  <img src="./images/Framework_Overview.png" alt="Overview" width="90%">
+  <img src="./images/Framework_Overview_White.png" alt="Overview" width="90%">
 </p>
 
