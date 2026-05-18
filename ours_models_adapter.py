@@ -52,9 +52,8 @@ class VisionGatedTextAggregator(nn.Module):
         BT, C = x_visual.size()
 
         if mode == 'mean':
-            # 直接在描述维度取平均，梯度会平均传回到每一个 text embedding
+
             T_C_fixed = category_text_embeddings.mean(dim=1)  # [C, D_txt]
-            # 扩展维度以匹配 batch [BT, C, D_txt]
             return T_C_fixed.unsqueeze(0).expand(BT, -1, -1)
         
         N_class, N_desc, D_text = category_text_embeddings.shape
@@ -81,11 +80,9 @@ class VisionGatedTextAggregator(nn.Module):
 
 class DWT2d(nn.Module):
     """
-    使用 PyWavelets 初始化权重的可微离散小波变换层。
     """
     def __init__(self, in_channels, wavelet='haar'):
         super().__init__()
-        # 1. 获取小波滤波器
         w = pywt.Wavelet(wavelet)
         dec_lo = torch.tensor(w.dec_lo[::-1], dtype=torch.float32)
         dec_hi = torch.tensor(w.dec_hi[::-1], dtype=torch.float32)
@@ -103,20 +100,16 @@ class DWT2d(nn.Module):
         self.register_buffer('weight', self.filters)
         self.stride = 2
 
-        self.pad = (filters.shape[-1] // 2) - 1 # 简化的 padding 策略，适用于偶数长度滤波器
+        self.pad = (filters.shape[-1] // 2) - 1 
 
     def forward(self, x):
         # x: [B, C, H, W]
         B, C, H, W = x.shape
-        # Depthwise Conv: groups=C
-        # 输出: [B, C*4, H/2, W/2]
+
         res = F.conv2d(x, self.weight, stride=self.stride, padding=self.pad, groups=C)
         
-        # 重组输出
-        # view -> [B, C, 4, H', W']
         res = res.view(B, C, 4, res.shape[2], res.shape[3])
         
-        # 分离各个频带
         ll = res[:, :, 0, :, :]
         lh = res[:, :, 1, :, :]
         hl = res[:, :, 2, :, :]
@@ -125,9 +118,6 @@ class DWT2d(nn.Module):
         return ll, (lh, hl, hh)
 
 class IDWT2d(nn.Module):
-    """
-    使用 PyWavelets 初始化权重的可微逆小波变换层。
-    """
     def __init__(self, in_channels, wavelet='haar'):
         super().__init__()
         w = pywt.Wavelet(wavelet)
@@ -159,9 +149,6 @@ class IDWT2d(nn.Module):
         return res
 
 class DWTInteractiveAdapter(nn.Module):
-    """
-    集成 PyWavelets 的双向交互 Adapter。
-    """
     def __init__(self, in_channels, adapter_channels, wavelet='haar'):
         super().__init__()
         self.in_channels = in_channels
@@ -211,30 +198,24 @@ class DWTInteractiveAdapter(nn.Module):
         F_LL, (F_LH, F_HL, F_HH) = self.dwt(x_spatial)
 
         if mode == 'lf_only':
-            # 仅保留低频，高频全置零
             F_LH_new = torch.zeros_like(F_LH)
             F_HL_new = torch.zeros_like(F_HL)
             F_HH_new = torch.zeros_like(F_HH)
             F_LL_new = F_LL  # 不进行高频调制
 
         elif mode == 'hf_only':
-            # 仅保留高频，但不使用低频生成的 Mask 进行引导
-            # 也不进行高频对低频的调制，单纯是 DWT -> IDWT 的通路（带简单的特征变换）
             F_LH_new, F_HL_new, F_HH_new = F_LH, F_HL, F_HH
             F_LL_new = F_LL
 
         else: # mode == 'full' (Ours)
-            # 3. 低频 -> 高频 (语义引导)
             F_High_concat = torch.cat([F_LH, F_HL, F_HH], dim=1)
             mask_semantic = self.lf_context_conv(F_LL)
             F_High_new = F_High_concat * mask_semantic
             
-            # 4. 高频 -> 低频 (细节调制)
             modulation_params = self.hf_modulation_conv(F_High_new)
             gamma, beta = torch.chunk(modulation_params, 2, dim=1)
             F_LL_new = F_LL * (1 + gamma) + beta
             
-            # 拆分回三个高频分量
             F_LH_new, F_HL_new, F_HH_new = torch.chunk(F_High_new, 3, dim=1)
         
         # F_High_concat = torch.cat([F_LH, F_HL, F_HH], dim=1)
@@ -260,59 +241,45 @@ class DWTInteractiveAdapter(nn.Module):
 
 
 class DriftAwareTemporalAdapter(nn.Module):
-    """
-    替代原有的 Adapter1 (1D Conv)。
-    针对超声探头漂移问题，使用 Self-Attention 动态聚合帧特征。
-    """
+    
     def __init__(self, in_channels, adapter_channels, kernel_size=None, T=8):
         super().__init__()
         self.T = T
         self.scale = adapter_channels ** -0.5
         
         self.fc1 = nn.Linear(in_channels, adapter_channels)
-        
-        # Q, K, V 投影
+    
         self.to_qkv = nn.Linear(adapter_channels, adapter_channels * 3, bias=False)
         
-        # 时间位置编码 (learnable)
         self.pos_emb = nn.Parameter(torch.randn(1, T, adapter_channels) * 0.02)
         
         self.fc2 = nn.Linear(adapter_channels, in_channels)
         self.act = nn.GELU()
-        
-        # 初始化
+       
         nn.init.constant_(self.fc1.bias, 0.)
         nn.init.constant_(self.fc2.bias, 0.)
 
     def forward(self, x):
-        # x: [BT, C] (来自 VisionTransformer 的输出)
         BT, C = x.size()
         T = self.T
         B = BT // T
         
-        x_res = x # 残差路径
-        
-        # 1. 降维
-        x_mid = self.act(self.fc1(x)) # [BT, Ca]
-        
-        # 2. 时序维度重组 [B, T, Ca]
+        x_res = x 
+
+        x_mid = self.act(self.fc1(x)) 
+
         x_temporal = x_mid.view(B, T, -1)
-        
-        # 3. 注入位置编码
+
         x_temporal = x_temporal + self.pos_emb
-        
-        # 4. Self-Attention (Drift-Aware)
+
         qkv = self.to_qkv(x_temporal).chunk(3, dim=-1)
         q, k, v = map(lambda t: t, qkv)
-        
-        # Attention Map: [B, T, T]
-        # 漂移帧(Out-of-distribution)与其他帧相似度低，权重会被 Softmax 压低
+
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
         
         x_out = attn @ v # [B, T, Ca]
-        
-        # 5. 还原
+
         x_out = x_out.view(BT, -1)
         x_out = self.fc2(x_out)
         
@@ -326,10 +293,8 @@ class UnifiedDriftAwareAdapter(nn.Module):
         self.T = T
         Ca = adapter_channels
 
-        # 1. 降维
         self.fc1 = nn.Linear(in_channels, Ca)
 
-        # 2. Depthwise Temporal Conv（局部时间建模）
         self.conv = nn.Conv1d(
             Ca, Ca,
             kernel_size=kernel_size,
@@ -338,122 +303,80 @@ class UnifiedDriftAwareAdapter(nn.Module):
             groups=Ca
         )
 
-        # 3. Drift-Aware Temporal Attention（全局时序依赖）
         self.scale = Ca ** -0.5
         self.to_qkv = nn.Linear(Ca, Ca * 3, bias=False)
 
-        # learnable position embedding
-        # self.pos_emb = nn.Parameter(torch.randn(1, T, Ca) * 0.02)
-        # 定义一个生成正弦位置编码的辅助工具
         self.register_buffer('inv_freq', 1.0 / (10000 ** (torch.arange(0, Ca, 2).float() / Ca)))
         self.learnable_pe = nn.Parameter(torch.randn(1, T, Ca) * 0.02)
-        # 4. 升维
+
         self.fc2 = nn.Linear(Ca, in_channels)
         self.act = nn.GELU()
 
-        # 初始化
         nn.init.constant_(self.conv.weight, 0.)
         nn.init.constant_(self.conv.bias, 0.)
         nn.init.constant_(self.fc1.bias, 0.)
         nn.init.constant_(self.fc2.bias, 0.)
 
     def get_physics_coordinate(self, x, B, T):
-        """
-        计算基于物理运动的“弹性时间坐标”
-        """
-        # 1. 计算 NCC (无需梯度，仅作为测量工具)
+
         x_detach = x.detach().view(B, T, -1)
         x_norm = F.normalize(x_detach, p=2, dim=-1)
         x_prev = torch.cat([x_norm[:, :1, :], x_norm[:, :-1, :]], dim=1)
         
-        # values in [-1, 1]
+
         ncc = (x_norm * x_prev).sum(dim=-1) 
-        
-        # 2. 将 NCC 转换为“位移代价”
-        # NCC越小(差异大)，位移越大；NCC越大(静止)，位移越小。
-        # 范围 [0, 2]
+
         motion_cost = 1.0 - ncc 
-        
-        # 3. 计算累积物理坐标 [B, T]
-        # t=0: 0
-        # t=1: 0 + cost_1
-        # t=2: 0 + cost_1 + cost_2
+
         physical_coords = torch.cumsum(motion_cost, dim=1)
         
         return physical_coords
 
     def get_physics_pos_embed(self, coords, Ca):
-        """
-        根据物理坐标生成 Sinusoidal Positional Embedding
-        coords: [B, T]
-        Output: [B, T, Ca]
-        """
+
         B, T = coords.shape
         
-        # 扩展维度以便广播 [B, T, 1] * [Ca/2]
         sin_inp = coords.unsqueeze(-1) * self.inv_freq.unsqueeze(0).unsqueeze(0)
-        
-        # 生成 sin 和 cos
+
         pos_emb = torch.cat([sin_inp.sin(), sin_inp.cos()], dim=-1)
         
         return pos_emb
 
     def forward(self, x, pe_type='learnable'):
-        # 输入维度 [BT, C]
+
         BT, C = x.size()
         T = self.T
         B = BT // T
         Ca = self.fc1.out_features
 
-        x_res = x  # residual
+        x_res = x 
 
-        # Step 2: 双流特征提取
         x_mid = self.act(self.fc1(x))  # [BT, Ca]
 
         x_conv = x_mid.view(B, T, Ca).permute(0, 2, 1).contiguous()  # [B, Ca, T]
         x_conv = self.conv(x_conv)  # depthwise conv
         x_conv = x_conv.permute(0, 2, 1).contiguous()  # [B, T, Ca]
 
-        x_att = x_mid.view(B, T, Ca)  #+ self.pos_emb  # 加入时间编码
+        x_att = x_mid.view(B, T, Ca) 
 
-        # -----------------------------------------------------------
-        # [增强点] 物理时间扭曲 (Physics-Warped Positional Encoding)
-        # -----------------------------------------------------------
-        # # 1. 获取物理坐标 (反映了真实的探头轨迹)
-        # phy_coords = self.get_physics_coordinate(x, B, T)
-        
-        # # 2. 生成动态位置编码
-        # # 注意：每一段视频、每一个Batch的物理位置编码都是不一样的！
-        # # 这就是“Dynamic”的核心，它随扫查动作而变。
-        # dynamic_pos_emb = self.get_physics_pos_embed(phy_coords, Ca)
-        
-        # # 3. 注入位置信息
-        # x_att = x_att + dynamic_pos_emb
-        
-        # -----------------------------------------------------------
 
         if pe_type == 'physics':
-            # Ours: 动态物理坐标
-            # 注意：get_physics_coordinate 内部使用了 detach()，
-            # 物理坐标本身不传导梯度，只作为位置信号
+
             phy_coords = self.get_physics_coordinate(x, B, T)
             pos_emb = self.get_physics_pos_embed(phy_coords, Ca)
             x_att = x_att + pos_emb.to(x_att.dtype)
             
         elif pe_type == 'sinusoidal':
-            # Baseline 1: 固定时间步 (0, 1, 2, ..., T-1)
             fixed_coords = torch.arange(T, device=x.device, dtype=torch.float32)
             fixed_coords = fixed_coords.unsqueeze(0).expand(B, -1) # [B, T]
             pos_emb = self.get_physics_pos_embed(fixed_coords, Ca)
             x_att = x_att + pos_emb.to(x_att.dtype)
             
         elif pe_type == 'learnable':
-            # Baseline 2: 传统的 Parameter PE
-            # self.learnable_pe 是 nn.Parameter，会自动广播 Batch 维度
+
             x_att = x_att + self.learnable_pe.to(x_att.dtype)
             
         elif pe_type == 'none':
-            # Baseline 3: 无位置信息，仅靠 Conv 提供局部位置感
             pass
         
         qkv = self.to_qkv(x_att).chunk(3, dim=-1)
@@ -464,9 +387,7 @@ class UnifiedDriftAwareAdapter(nn.Module):
         attn = attn.softmax(dim=-1)
 
         if not self.training:
-            # 这里的 attn shape 是 [B, T, T]
-            # B 是 Batch Size (有多少个视频片段/目标帧)
-            # T 是帧数 (例如 8)
+
             self.last_attn_weights = attn.detach().cpu()
 
         x_global = attn @ v  # [B, T, Ca]
@@ -482,18 +403,14 @@ class CrossModalAttentionAdapter(nn.Module):
         super().__init__()
         self.attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
         
-        self.ln_q = LayerNorm(dim) # 视觉特征是 768，这个保持不变
+        self.ln_q = LayerNorm(dim) 
         
-        # 【修改点 1】: Key 和 Value 的 LayerNorm 必须是 512 维 (文本原始维度)
         self.ln_k = LayerNorm(512) 
         self.ln_v = LayerNorm(512)
 
         self.attn.out_proj.weight.data.zero_()
         self.attn.out_proj.bias.data.zero_()
         
-        # 删除 text_projector，我们用 padding
-        # self.text_projector = nn.Linear(512, 768) 
-
     def forward(self, x, text_seq):
         """
         x: [BT, L_vis, 768]
@@ -503,26 +420,17 @@ class CrossModalAttentionAdapter(nn.Module):
         B, L_txt, txt_dim = text_seq.size() # txt_dim = 512
         T = BT // B
 
-        # 1. 扩展 Batch 维度 (Batch -> Batch*Time)
-        # 先不要 Pad，先扩展
         text_expanded = text_seq.unsqueeze(1).expand(-1, T, -1, -1).reshape(BT, L_txt, txt_dim)
 
-        # 2. 【关键修改】: 先在 512 维度上做 LayerNorm
-        # 这样保留了 CLIP 原始特征的相对分布
         k_512 = self.ln_k(text_expanded)
         v_512 = self.ln_v(text_expanded)
 
-        # 3. 【关键修改】: 归一化之后再 Pad 到 768
-        # F.pad (左, 右, 上, 下...)
-        # 此时补进去的 0 依然是 0，不会被归一化改变
         padding_size = C - txt_dim
         k = F.pad(k_512, (0, padding_size), "constant", 0)
         v = F.pad(v_512, (0, padding_size), "constant", 0)
 
-        # 4. 对 Query (视觉) 进行正常的归一化
         q = self.ln_q(x)
 
-        # 5. Attention
         out, _ = self.attn(query=q, key=k, value=v, need_weights=False)
         
         return x + out
@@ -767,8 +675,7 @@ class ResidualAttentionBlock(nn.Module):
         #     kernel_size=3,
         #     T=self.T
         # )
-        
-        # 2. 定义 Text Adapter (用于文本分支)
+
         text_adapter_class = functools.partial(
             TextAdapter, 
             in_channels=d_model, 
@@ -796,11 +703,9 @@ class ResidualAttentionBlock(nn.Module):
         else:
             self.adapter_pre_attn = text_adapter_class() if adapter_pre_attn else None
             self.adapter_pre_mlp = text_adapter_class() if adapter_pre_mlp else None
-            
-            # 文本分支不需要这两个特有 Adapter
+
             self.spatial_adapter = None
 
-        # Offset Adapter 占位 (M2CLIP 代码中通常初始化为 None)
         self.adapter_pre_attn_off = None
         self.adapter_pre_mlp_off = None
         
@@ -825,12 +730,8 @@ class ResidualAttentionBlock(nn.Module):
         try:
             x, weights = self.attn(x, x, x, need_weights=True, average_attn_weights=False, attn_mask=self.attn_mask)
         except TypeError:
-            # 兼容旧版 PyTorch (旧版默认返回 [B, L, L] 或 [B, H, L, L] 取决于实现)
             x, weights = self.attn(x, x, x, need_weights=True, attn_mask=self.attn_mask)
 
-        # 3. 【关键】将权重保存在当前 Block 对象中，供外部读取
-        # weights shape 通常是 [Batch, Heads, Seq_Len, Seq_Len]
-        # 使用 detach() 避免保存计算图，节省显存
         self.last_attn_weights = weights.detach().cpu()
 
         return x.permute(1,0,2)
@@ -859,8 +760,7 @@ class ResidualAttentionBlock(nn.Module):
         
 
     def forward(self, x: torch.Tensor, text_features: torch.Tensor = None) -> torch.Tensor:
-                    
-        # [新增] 视觉分支的空间 Adapter
+
 
         if self.adapter_pre_attn is not None:
             x = self.adapter_pre_attn(x)
@@ -869,14 +769,10 @@ class ResidualAttentionBlock(nn.Module):
 
         if self.spatial_adapter is not None:
             x = self.spatial_adapter(x)
-        
-        # 2. MLP 前的 Adapter (原有逻辑 或 新的 Cross Adapter)
+
         if self.adapter_pre_mlp is not None: # Text Branch
             x = self.adapter_pre_mlp(x)
-            
-        # # [新增] 视觉分支的交互 Adapter
-        # if self.cross_adapter is not None and text_features is not None:
-        #     x = self.cross_adapter(x, text_features)
+
 
         x = x + self.mlp(self.ln_2(x))
         return x
@@ -932,13 +828,6 @@ class Transformer(nn.Module):
     def forward(self, x: torch.Tensor, text_features: Union[torch.Tensor, list] = None, return_intermediate: bool = False) -> Union[torch.Tensor, list]:
         intermediate_outputs = []
         for i, block in enumerate(self.resblocks):
-            # 原代码逻辑（删除）：
-            # if isinstance(text_features, list):
-            #     layer_feat = text_features[i] if i < len(text_features) else text_features[-1]
-            #     x = block(x, text_features=layer_feat)
-            
-            # 【新代码逻辑】：直接传入 text_features
-            # 因为我们在外部已经决定只传最后一个层的特征（一个Tensor），所有层都复用它
             x = block(x, text_features=text_features)
             
             if return_intermediate:
@@ -1051,12 +940,10 @@ class VisionTransformer(nn.Module):
         x1 = self.ln_post(x)
 
         if not isinstance(self.t_adapter, nn.Identity):
-            # 原有逻辑
             x1 = x1[:,0,:] @ self.proj
             x1 = self.t_adapter(x1) 
             x = x1.view(B,T,-1).mean(dim=1, keepdim=False)
         else:
-            # Base 逻辑：没有时序 Adapter，直接平均池化
             x1 = x1[:,0,:] @ self.proj
             x = x1.view(B,T,-1).mean(dim=1, keepdim=False)
             
@@ -1202,9 +1089,8 @@ class CLIP(nn.Module):
         self.class_text_descriptors = self.build_class_text_descriptors()
         if use_vision_gated:
             self.vg_agg = VisionGatedTextAggregator(
-                vision_dim=512,  # 例如 768
-                text_dim=embed_dim,       # 例如 512
-                # 不再需要 category_text_embeddings
+                vision_dim=512,  
+                text_dim=embed_dim,      
             )
         else:
             self.vg_agg = None
@@ -1307,7 +1193,7 @@ class CLIP(nn.Module):
         if t_visual is not None and self.vg_agg is not None:
             text_features = self.vg_agg(t_visual, self.class_text_descriptors)
         else:
-            text_features = final_emb  # 默认行为保持不变
+            text_features = final_emb  
 
         text_features_norm = final_emb / final_emb.norm(dim=1, keepdim=True) 
 
