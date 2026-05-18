@@ -1,4 +1,3 @@
-# modified from: https://github.com/openai/CLIP/blob/a9b1bf5920416aaeaec965c25dd9e8f98c864f16/clip/model.py
 
 from typing import Tuple
 from collections import OrderedDict
